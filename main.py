@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import httpx
@@ -8,8 +9,8 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(
     title="MovieBox API Pro",
-    description="Full Pure REST API for moviebox.ph — Fixed Streaming Endpoint",
-    version="2.2.0"
+    description="Full Pure REST API for moviebox.ph — Zero Scraping",
+    version="2.1.5"
 )
 
 app.add_middleware(
@@ -21,9 +22,6 @@ app.add_middleware(
 
 BASE_URL = "https://moviebox.ph"
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
-
-# আপডেট করা সঠিক স্ট্রিমিং বেস ইউআরএল
-STREAM_BASE = "https://h5.aoneroom.com/wefeed-h5-bff"
 
 _bearer_token: str | None = None
 
@@ -43,11 +41,15 @@ DEFAULT_HEADERS = {
     "sec-fetch-site": "cross-site",
 }
 
+# Player-side headers for the stream domain (netfilm.world)
 PLAYER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://h5.aoneroom.com",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "X-Client-Info": '{"timezone":"Asia/Dhaka"}',
+    "X-Source": "",
     "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
@@ -55,100 +57,6 @@ PLAYER_HEADERS = {
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
 }
-
-# ── Content Validation Helpers ──────────────────────────────────────
-# These check whether a given slug actually has a valid detail response
-# (not 404, not premium-only) so we can filter out unavailable content
-# before sending results to the Roku client.
-#
-# Performance: Uses a concurrency semaphore (max 5 parallel), an
-# in-memory cache (TTL 10 min), and a batch timeout (15s) to avoid
-# blocking the Roku loading screen.
-
-import time as _time
-
-_slug_cache: dict[str, tuple[bool, float]] = {}   # slug -> (is_valid, timestamp)
-_CACHE_TTL = 600   # 10 minutes
-_validation_semaphore = asyncio.Semaphore(5)       # max 5 concurrent upstream checks
-
-
-async def _validate_slug(slug: str, client: httpx.AsyncClient, token: str) -> bool:
-    """Return True if the slug has a valid detail response."""
-    if not slug:
-        return False
-
-    # Check cache first
-    cached = _slug_cache.get(slug)
-    if cached:
-        is_valid, ts = cached
-        if _time.time() - ts < _CACHE_TTL:
-            return is_valid
-
-    url = f"{API_BASE}/detail?detailPath={slug}"
-    try:
-        headers = {
-            **DEFAULT_HEADERS,
-            "Authorization": f"Bearer {token}" if token else "",
-        }
-        async with _validation_semaphore:
-            resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            _slug_cache[slug] = (False, _time.time())
-            return False
-        data = resp.json()
-        detail_data = data.get("data")
-        if not detail_data:
-            _slug_cache[slug] = (False, _time.time())
-            return False
-        subject = detail_data.get("subject")
-        if not subject:
-            _slug_cache[slug] = (False, _time.time())
-            return False
-        if subject.get("isPremium") is True:
-            _slug_cache[slug] = (False, _time.time())
-            return False
-        _slug_cache[slug] = (True, _time.time())
-        return True
-    except Exception:
-        _slug_cache[slug] = (False, _time.time())
-        return False
-
-
-async def _validate_items(items: list) -> list:
-    """Filter a list of items, keeping only those with valid detail slugs.
-    Uses a shared client, semaphore for concurrency control, and a batch timeout."""
-    if not items:
-        return items
-
-    token = await _get_bearer_token()
-
-    async def _do_validation():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
-            async def _check(item):
-                slug = item.get("slug")
-                is_valid = await _validate_slug(slug, client, token)
-                return (item, is_valid)
-
-            results = await asyncio.gather(
-                *[_check(item) for item in items],
-                return_exceptions=True
-            )
-        valid_items = []
-        for result in results:
-            if isinstance(result, Exception):
-                continue
-            item, is_valid = result
-            if is_valid:
-                valid_items.append(item)
-        return valid_items
-
-    try:
-        # Total batch timeout — if validation takes too long, return all items
-        # rather than blocking the Roku loading screen forever
-        return await asyncio.wait_for(_do_validation(), timeout=15.0)
-    except asyncio.TimeoutError:
-        print("[VALIDATE] Batch validation timed out, returning all items unfiltered")
-        return items
 
 async def _get_bearer_token() -> str:
     """Auto-acquire a guest JWT from the x-user response header."""
@@ -161,8 +69,10 @@ async def _get_bearer_token() -> str:
         if x_user:
             _bearer_token = json.loads(x_user).get("token")
         if not _bearer_token:
+            # fallback: read from set-cookie
             cookie = resp.headers.get("set-cookie", "")
-            m = re.search(r"token=([^;]+)", cookie)
+            import re as _re
+            m = _re.search(r"token=([^;]+)", cookie)
             if m:
                 _bearer_token = m.group(1)
     return _bearer_token or ""
@@ -182,6 +92,7 @@ async def _make_request(url: str, method: str = "GET", payload: dict = None, cus
             else:
                 resp = await client.get(url, headers=headers)
 
+            # Refresh token if server sends a new one
             x_user = resp.headers.get("x-user")
             if x_user:
                 new_token = json.loads(x_user).get("token")
@@ -240,6 +151,12 @@ async def dashboard():
             header {
                 text-align: center;
                 margin-bottom: 80px;
+                animation: fadeInDown 1s ease-out;
+            }
+
+            @keyframes fadeInDown {
+                from { opacity: 0; transform: translateY(-30px); }
+                to { opacity: 1; transform: translateY(0); }
             }
 
             h1 {
@@ -277,9 +194,20 @@ async def dashboard():
                 border: 1px solid var(--glass);
                 border-radius: 28px;
                 padding: 35px;
+                transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
                 backdrop-filter: blur(12px);
+                position: relative;
+                overflow: hidden;
                 display: flex;
                 flex-direction: column;
+            }
+
+            @media (hover: hover) {
+                .card:hover {
+                    transform: translateY(-12px) scale(1.02);
+                    border-color: rgba(255,255,255,0.2);
+                    box-shadow: 0 30px 60px rgba(0,0,0,0.5);
+                }
             }
 
             .card-title {
@@ -289,6 +217,15 @@ async def dashboard():
                 display: flex;
                 align-items: center;
                 gap: 12px;
+            }
+
+            .card-title i {
+                width: 32px; height: 32px;
+                background: rgba(255,255,255,0.05);
+                border-radius: 8px;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 1rem; color: var(--accent);
+                font-style: normal;
             }
 
             .card-desc {
@@ -309,6 +246,15 @@ async def dashboard():
                 border: 1px solid rgba(0,242,255,0.15);
                 margin-bottom: 25px;
                 word-break: break-all;
+                position: relative;
+            }
+
+            .endpoint::after {
+                content: 'GET';
+                position: absolute;
+                right: 14px; top: 14px;
+                font-size: 0.65rem; font-weight: 800;
+                color: rgba(255,255,255,0.3);
             }
 
             .btn {
@@ -328,40 +274,94 @@ async def dashboard():
             .btn:hover {
                 background: var(--primary);
                 color: #fff;
+                transform: translateY(-2px);
+                box-shadow: 0 10px 25px rgba(255, 61, 113, 0.4);
             }
 
-            footer { text-align: center; padding: 80px 0 40px; }
-            .dev-tag { font-weight: 800; color: #666; font-size: 0.75rem; border: 1px solid #222; padding: 12px 30px; border-radius: 50px; display: inline-block; }
+            footer {
+                text-align: center;
+                padding: 80px 0 40px;
+                animation: fadeIn 2s ease;
+            }
+
+            @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+            .dev-tag {
+                font-weight: 800;
+                color: #666;
+                letter-spacing: 3px;
+                text-transform: uppercase;
+                font-size: 0.75rem;
+                border: 1px solid #222;
+                padding: 12px 30px;
+                border-radius: 50px;
+                display: inline-block;
+                background: rgba(255,255,255,0.01);
+                transition: all 0.3s;
+            }
+
+            .dev-tag:hover {
+                color: var(--text);
+                border-color: var(--primary);
+                letter-spacing: 5px;
+            }
+
+            @media (max-width: 480px) {
+                .container { padding: 40px 16px; }
+                .card { padding: 25px; }
+                h1 { margin-bottom: 10px; }
+            }
         </style>
     </head>
     <body>
         <div class="container">
             <header>
-                <div class="badge">Enterprise API Solution v2.2.0</div>
+                <div class="badge">Enterprise API Solution</div>
                 <h1>MovieBox Pro</h1>
-                <p style="color: #667; font-size: 1.25rem; font-weight: 300;">Direct Stream Extraction API</p>
+                <p style="color: #667; font-size: 1.25rem; font-weight: 300;">State-of-the-Art Pure API Architecture</p>
             </header>
 
             <div class="grid">
                 <div class="card">
-                    <div class="card-title">🏠 Discover Home</div>
-                    <p class="card-desc">Headlines, recommended content, and trending blocks.</p>
+                    <div class="card-title"><i>🏠</i> Discover Home</div>
+                    <p class="card-desc">The ultimate window into MovieBox. Headlines, recommended content, and trending blocks updated in real-time.</p>
                     <div class="endpoint">/home</div>
                     <a href="/home" target="_blank" class="btn">Launch API</a>
                 </div>
 
                 <div class="card">
-                    <div class="card-title">🔍 Smart Search</div>
-                    <p class="card-desc">High-precision search engine results.</p>
+                    <div class="card-title"><i>🔍</i> Smart Search</div>
+                    <p class="card-desc">High-precision search engine results. Returns titles, posters, and slugs for lightning-fast matching.</p>
                     <div class="endpoint">/search?q=Attack on Titan</div>
                     <a href="/search?q=Attack on Titan" target="_blank" class="btn">Test Search</a>
                 </div>
 
                 <div class="card">
-                    <div class="card-title">🎬 Direct Stream Engine</div>
-                    <p class="card-desc">Working direct MP4 CDN links from aoneroom.com (Supports 360p - 1080p).</p>
-                    <div class="endpoint">/api/stream/{subject_id}?se=0&ep=0</div>
-                    <a href="/api/stream/56988683026712168?detail_path=attack-on-titan-hindi-kGWQOIx0d4&se=0&ep=0" target="_blank" class="btn">Get Direct MP4 Links</a>
+                    <div class="card-title"><i>🆔</i> Metadata A-Z</div>
+                    <p class="card-desc">Deep-dive into any subject. Episodes, seasons, languages, and full high-resolution metadata trees.</p>
+                    <div class="endpoint">/detail/{slug}</div>
+                    <a href="/detail/attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Fetch Specs</a>
+                </div>
+
+                <div class="card">
+                    <div class="card-title"><i>🎬</i> Stream Engine</div>
+                    <p class="card-desc">Dynamic domain discovery and direct MP4 extraction. Supports multiple resolutions and qualities.</p>
+                    <div class="endpoint">/api/stream/{subject_id}</div>
+                    <a href="/api/stream/56988683026712168?detail_path=attack-on-titan-hindi-kGWQOIx0d4" target="_blank" class="btn">Get Player Link</a>
+                </div>
+
+                <div class="card">
+                    <div class="card-title"><i>📦</i> Catalog Filters</div>
+                    <p class="card-desc">Paginated collections for all genres. Movies, TV shows, and Animations filtered by professional criteria. Pagination Supported.</p>
+                    <div class="endpoint">/tv-series?page=2</div>
+                    <a href="/tv-series?page=2" target="_blank" class="btn">Test Page 2</a>
+                </div>
+
+                <div class="card">
+                    <div class="card-title"><i>💬</i> Subtitle Suite</div>
+                    <p class="card-desc">Access to the complete SRT/VTT global database for all streaming subjects.</p>
+                    <div class="endpoint">/api/stream/{id}/captions</div>
+                    <a href="/api/stream/6207982430134357800/captions?detail_path=breaking-bad-ej6Bp0MCAo7" target="_blank" class="btn">Retrive Subs</a>
                 </div>
             </div>
 
@@ -390,8 +390,6 @@ async def get_home():
                 "subject_id": (item.get("subject") or {}).get("subjectId"),
                 "badge": (item.get("subject") or {}).get("corner")
             } for item in op.get("banner", {}).get("items", []) if item.get("title") and "Communities" not in item.get("title")]
-            # Validate banner items — remove those with no valid detail page
-            items = await _validate_items(items)
             sections.append({"section": "Banner", "count": len(items), "items": items})
         elif op_type in ["SUBJECTS_MOVIE", "SUBJECTS_TV", "SUBJECTS_ANIMATION"]:
             items = [{
@@ -402,8 +400,6 @@ async def get_home():
                 "badge": sub.get("corner"),
                 "rating": sub.get("imdbRatingValue")
             } for sub in op.get("subjects", [])]
-            # Validate section items — remove those with no valid detail page
-            items = await _validate_items(items)
             sections.append({"section": title, "count": len(items), "items": items})
     return {"status": "success", "sections": sections}
 
@@ -464,16 +460,8 @@ async def search(q: str = Query(..., min_length=1), page: int = 1):
         "name": sub.get("title"),
         "poster_url": sub.get("cover", {}).get("url"),
         "slug": sub.get("detailPath"),
-        "subject_id": sub.get("subjectId"),
-        "description": sub.get("description", ""),
-        "genre": sub.get("genre", ""),
-        "language": sub.get("corner", ""),
-        "rating": sub.get("imdbRatingValue", ""),
-        "year": sub.get("releaseDate", "")[:4] if sub.get("releaseDate") else "",
-        "country": sub.get("countryName", "")
+        "subject_id": sub.get("subjectId")
     } for sub in raw]
-    # Validate search results — remove items with no valid detail page
-    items = await _validate_items(items)
     pager = inner.get("pager", {})
     total = pager.get("totalCount") or inner.get("total") or len(items)
     return {"query": q, "page": page, "total": total, "items": items}
@@ -483,56 +471,58 @@ async def get_movie_detail(slug: str):
     url = f"{API_BASE}/detail?detailPath={slug}"
     return await _make_request(url)
 
-# ----------------------------------------------------
-# 📌 ফিক্স করা স্ট্রিমিং এন্ডপয়েন্ট (Aoneroom Direct MP4 Stream)
-# ----------------------------------------------------
 @app.get("/api/stream/{subject_id}")
-async def get_stream_sources(subject_id: str, detail_path: str = "", se: int = 0, ep: int = 0):
-    # আপনার রিকমেন্ড করা ওয়ার্কিং পাথ
-    play_url = f"{STREAM_BASE}/web/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-    
-    player_referer = f"https://h5.aoneroom.com/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
+async def get_stream_sources(subject_id: str, detail_path: str, se: int = 1, ep: int = 1):
+    # Step 1: get the player domain
+    dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
+    domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
+
+    # Step 2: build the Referer the way the real browser player does
+    player_referer = (
+        f"{domain}/spa/videoPlayPage/movies/{detail_path}"
+        f"?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
+    )
+    play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
         resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
-        
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Stream service unavailable")
-            
-        res_json = resp.json()
-        data = res_json.get("data", {})
+        data = resp.json().get("data", {})
 
     has_resource = data.get("hasResource", False)
-    
     streams = [
         {
-            "resolution": f"{s.get('resolutions')}p" if s.get('resolutions') else "HD",
-            "format": s.get("format", "mp4"),
+            "resolution": f"{s.get('resolutions')}p",
+            "format": s.get("format"),
             "url": s.get("url"),
             "size": s.get("size"),
             "duration": s.get("duration"),
             "codec": s.get("codecName")
         }
-        for s in data.get("streams", []) if s.get("url")
+        for s in data.get("streams", [])
     ]
-    
     return {
         "subject_id": subject_id,
         "se": se,
         "ep": ep,
-        "has_resource": has_resource or len(streams) > 0,
+        "has_resource": has_resource,
         "sources": streams,
         "hls": data.get("hls", []),
         "dash": data.get("dash", []),
         "free_episodes": data.get("freeNum"),
         "limited": data.get("limited", False),
-        "note": None if (has_resource or len(streams) > 0) else "No stream found for this selection."
+        "note": None if has_resource else "No stream found for this episode."
     }
 
 @app.get("/api/stream/{subject_id}/captions")
-async def get_captions(subject_id: str, detail_path: str = "", se: int = 0, ep: int = 0):
-    play_url = f"{STREAM_BASE}/web/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
-    player_referer = f"https://h5.aoneroom.com/spa/videoPlayPage/movies/{detail_path}?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
+async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int = 1):
+    dom_data = await _make_request(f"{API_BASE}/media-player/get-domain")
+    domain = dom_data.get("data", "https://netfilm.world").rstrip("/")
+
+    player_referer = (
+        f"{domain}/spa/videoPlayPage/movies/{detail_path}"
+        f"?id={subject_id}&type=/movie/detail&detailSe={se}&detailEp={ep}&lang=en"
+    )
+    play_url = f"{domain}/wefeed-h5api-bff/subject/play?subjectId={subject_id}&se={se}&ep={ep}&detailPath={detail_path}"
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
         play_resp = await client.get(play_url, headers={**PLAYER_HEADERS, "Referer": player_referer})
@@ -564,4 +554,5 @@ async def get_captions(subject_id: str, detail_path: str = "", se: int = 0, ep: 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
